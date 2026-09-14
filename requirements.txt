@@ -1,0 +1,3 @@
+# โมดูลที่โปรเจกต์ CNC ใช้จริง
+pyserial==3.5   # backend.py: serial, serial.tools.list_ports
+PyQt5==5.15.11  # main.py / frontend.py: GUI
