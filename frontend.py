@@ -200,6 +200,10 @@ class CalibratePage(QWidget):
         btn_move.setMinimumHeight(45)
         btn_move.clicked.connect(self.do_move)
 
+        self.btn_home = QPushButton("Homing  ($H)")
+        self.btn_home.setMinimumHeight(45)
+        self.btn_home.clicked.connect(self.do_home)
+
         # ----------------------------------------------------
         # กล่องปรับค่า steps :  ค่าใหม่ = ค่าเดิม × (สั่ง ÷ จริง)
         # ----------------------------------------------------
@@ -260,15 +264,24 @@ class CalibratePage(QWidget):
         btn_back = QPushButton("< กลับเมนู")
         btn_back.clicked.connect(goto_menu)
 
+        run_lay = QHBoxLayout()
+        run_lay.addWidget(btn_move)
+        run_lay.addWidget(self.btn_home)
+
         lay = QVBoxLayout(self)
         lay.addWidget(title)
         lay.addWidget(box_ctrl)
-        lay.addWidget(btn_move)
+        lay.addLayout(run_lay)
         lay.addWidget(box_cal)
         lay.addStretch()
         lay.addWidget(btn_back)
 
         self.ctrl.settings.connect(self.on_settings)
+        self.ctrl.limit_hit.connect(self.on_limit_hit)
+        # $H เดินเสร็จ (หรือ error) ค่อยเปิดปุ่มคืน
+        self.ctrl.log.connect(
+            lambda m: self.btn_home.setEnabled(True) if "$H ->" in m else None
+        )
         self.on_axis_changed("X")
 
     # ---------- อัปเดตหน้าจอ ----------
@@ -319,6 +332,18 @@ class CalibratePage(QWidget):
         if self.rb_bwd.isChecked():
             amount = -amount
         self.ctrl.move(axis, amount, self.sp_feed.value())
+
+    def do_home(self):
+        """$H ใช้เวลานาน ปิดปุ่มไว้ก่อนกันกดซ้ำ"""
+        self.btn_home.setEnabled(False)
+        self.ctrl.home()
+
+    def on_limit_hit(self):
+        QMessageBox.warning(
+            self, "ชนลิมิตสวิตช์",
+            "แกน Y ชนลิมิตสวิตช์ — เบรกมอเตอร์แล้ว\n\n"
+            "กด Homing ($H) เพื่อกลับไปจุดเริ่มต้นก่อนสั่งเดินต่อ",
+        )
 
     def do_apply(self):
         axis = self.cb_axis.currentText()
@@ -383,6 +408,13 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)                 # ต่อเครื่องแล้วค่อยกดได้
         self.btn_stop.clicked.connect(self.ctrl.emergency_stop)
 
+        # ----- ไฟสถานะลิมิตสวิตช์ เห็นได้จากทุกหน้า -----
+        self.lb_limit = QLabel("ลิมิตสวิตช์ Y : —")
+        self.lb_limit.setAlignment(Qt.AlignCenter)
+        self.lb_limit.setMinimumHeight(30)
+        self.set_limit_style(None)
+        self.ctrl.limit.connect(self.on_limit)
+
         self.stack = QStackedWidget()
         self.page_connect = ConnectPage(self.ctrl, self.goto_menu)
         self.page_menu = MenuPage(self.ctrl, self.goto_calibrate, self.goto_connect)
@@ -393,19 +425,41 @@ class MainWindow(QMainWindow):
         central = QWidget()
         lay = QVBoxLayout(central)
         lay.addWidget(self.stack)
+        lay.addWidget(self.lb_limit)
         lay.addWidget(self.btn_stop)
         lay.addWidget(box_log)
         self.setCentralWidget(central)
 
         self.ctrl.log.connect(self.append_log)
         self.ctrl.connection_changed.connect(self.btn_stop.setEnabled)
+        self.ctrl.connection_changed.connect(self.on_connection_changed)
         self.append_log("พร้อมใช้งาน — เลือก port แล้วกดเชื่อมต่อ")
+
+    def set_limit_style(self, hit):
+        """hit: True=ชน (แดง) / False=ปกติ (เขียว) / None=ยังไม่รู้ (เทา)"""
+        color = {True: "#c0392b", False: "#27ae60", None: "#9e9e9e"}[hit]
+        self.lb_limit.setStyleSheet(
+            f"background-color: {color}; color: white; border-radius: 4px;"
+        )
+
+    def on_limit(self, lim):
+        """lim = [X, Y, Z] ดูแค่ตัวกลาง (แกน Y) เพราะ X/Z ยังไม่ได้ใส่สวิตช์"""
+        hit = lim[1] == 1
+        self.lb_limit.setText(
+            f"ลิมิตสวิตช์ Y : {'ชน!' if hit else 'ปกติ'}        [X, Y, Z] = {lim}"
+        )
+        self.set_limit_style(hit)
 
     def append_log(self, msg):
         self.txt_log.append(msg)
         self.txt_log.verticalScrollBar().setValue(
             self.txt_log.verticalScrollBar().maximum()
         )
+
+    def on_connection_changed(self, ok):
+        if not ok:
+            self.lb_limit.setText("ลิมิตสวิตช์ Y : —")
+            self.set_limit_style(None)
 
     def goto_connect(self):
         self.stack.setCurrentWidget(self.page_connect)

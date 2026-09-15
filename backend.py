@@ -18,6 +18,30 @@ STEPS_PARAM = {"X": "$100", "Y": "$101", "Z": "$102"}
 # บรรทัดค่า setting ที่ GRBL ตอบกลับตอนสั่ง $$  เช่น  $100=250.000
 RE_SETTING = re.compile(r"^\$(\d+)\s*=\s*([-\d.]+)")
 
+# ช่องสถานะลิมิตสวิตช์ใน status report เช่น  <Run|...|Lim:101>
+RE_LIM = re.compile(r"Lim:(\d+)")
+
+# แกนที่ใส่ลิมิตสวิตช์จริง = Y (ตัวกลางของ Lim:)
+# X กับ Z ยังไม่ได้ใส่ ขาลอยเป็น 1 ตลอด เลยไม่ดู
+LIMIT_AXIS = 1
+
+# คำสั่งที่ทำให้มอเตอร์เดิน ต้องเฝ้าลิมิตระหว่างทาง
+# ($H ไม่อยู่ในนี้ เพราะ homing มันต้องวิ่งไปแตะสวิตช์อยู่แล้ว)
+MOTION_PREFIX = ("G0", "G1")
+
+
+def parse_lim(line):
+    """แกะช่อง Lim: ออกจากบรรทัดเดียว  "...|Lim:101>" -> [1, 0, 1]
+
+    ไม่เจอช่อง Lim: (เป็นบรรทัด ok หรือบรรทัดว่าง) -> คืน None
+    """
+    m = RE_LIM.search(line)
+    if m:
+        bits = [int(b) for b in m.group(1)]
+        if len(bits) == 3:
+            return bits
+    return None
+
 
 def list_ports():
     """คืน list ของ port ที่เสียบอยู่ตอนนี้ [(device, description), ...]"""
@@ -42,6 +66,8 @@ class SerialWorker(QThread):
     command_done = pyqtSignal(str, str)    # (คำสั่ง, คำตอบ)
     settings = pyqtSignal(dict)            # ผลจากการสั่ง $$  {'$100': 250.0, ...}
     estopped = pyqtSignal()                # หยุดฉุกเฉินเสร็จ + รีเซ็ตเครื่องแล้ว
+    limit = pyqtSignal(list)               # สถานะลิมิต [X, Y, Z] เช่น [1, 0, 1]
+    limit_hit = pyqtSignal()               # แกน Y ชนสวิตช์ระหว่างเดิน (เบรกให้แล้ว)
 
     def __init__(self, port, baud, parent=None):
         super().__init__(parent)
@@ -51,6 +77,8 @@ class SerialWorker(QThread):
         self._queue = Queue()
         self._running = True
         self._abort = False     # ธงหยุดฉุกเฉิน — ให้ loop ที่รอคำตอบอยู่เลิกรอ
+        self._last_lim = None   # สถานะลิมิตล่าสุด (ยิง signal เฉพาะตอนเปลี่ยน)
+        self._next_poll = 0.0   # เวลาที่จะยิง '?' ครั้งถัดไป
 
     # ---------- API ที่เรียกจาก main thread ----------
     def send(self, cmd):
@@ -97,6 +125,7 @@ class SerialWorker(QThread):
             try:
                 cmd = self._queue.get(timeout=0.1)
             except Empty:
+                self._poll_status()      # ว่างอยู่ ถามสถานะลิมิตไปเรื่อย ๆ
                 continue
             if cmd is None:
                 break
@@ -107,6 +136,39 @@ class SerialWorker(QThread):
         except Exception:
             pass
         self.log.emit("ปิดการเชื่อมต่อแล้ว")
+
+    def _poll_status(self):
+        """ยิง '?' ตอนไม่มีคำสั่งค้าง เพื่ออัปเดตสถานะลิมิตให้หน้าจอ"""
+        if time.time() < self._next_poll:
+            return
+        self._next_poll = time.time() + 0.3
+        try:
+            self.ser.write(b"?")
+            line = self.ser.readline().decode(errors="ignore").strip()
+        except Exception:
+            return
+        lim = parse_lim(line)
+        if lim:
+            self._emit_limit(lim)
+
+    def _emit_limit(self, lim):
+        """ยิง signal เฉพาะตอนสถานะเปลี่ยน ไม่งั้น GUI โดนถล่ม"""
+        if lim != self._last_lim:
+            self._last_lim = lim
+            self.limit.emit(lim)
+
+    def _stop_motion(self):
+        """เบรกมอเตอร์ที่กำลังเดินอยู่ แล้วตั้งค่าเครื่องใหม่ (เหมือน stop() ใน test.py)"""
+        try:
+            self.ser.write(b"!")            # feed hold เบรกทันที
+            time.sleep(0.3)
+            self.ser.write(b"\x18")         # soft reset ล้างระยะที่เหลือในคิวเครื่อง
+            time.sleep(2)                   # รอ GRBL บูทใหม่
+            self.ser.reset_input_buffer()
+        except Exception as e:
+            self.log.emit(f"!! เบรกไม่สำเร็จ: {e}")
+        for c in ("$X", "G21", "G91"):
+            self._send_and_wait(c)
 
     def _drain_queue(self):
         """เทคำสั่งที่ค้างในคิวทิ้งให้หมด"""
@@ -133,16 +195,38 @@ class SerialWorker(QThread):
         self.estopped.emit()
 
     def _send_and_wait(self, cmd):
-        """ส่งคำสั่ง แล้ววนอ่านจนเจอ ok / error / ALARM"""
+        """ส่งคำสั่ง แล้ววนอ่านจนเจอ ok / error / ALARM
+
+        ถ้าเป็นคำสั่งเดิน (G0/G1) จะยิง '?' ถามสถานะไปด้วยระหว่างรอ
+        เจอแกน Y ชนสวิตช์เมื่อไหร่เบรกทันที ไม่ต้องรอเดินจบ
+        """
         try:
             self.ser.write((cmd + "\n").encode())
         except Exception as e:
             self.command_done.emit(cmd, f"error: เขียนไม่ได้ ({e})")
             return
 
+        watch = cmd.strip().upper().startswith(MOTION_PREFIX)
+        next_poll = 0.0
         lines = []                       # เก็บบรรทัดระหว่างทางไว้ (ใช้ตอนอ่าน $$)
         deadline = time.time() + 120     # กันค้างถ้าเครื่องไม่ตอบ
         while self._running and not self._abort and time.time() < deadline:
+            if watch:
+                if time.time() >= next_poll:
+                    next_poll = time.time() + 0.2  # อย่ายิงถี่เกิน GRBL จะตอบไม่ทัน
+                    try:
+                        self.ser.write(b"?")
+                    except Exception:
+                        pass
+                # ถ้ายังไม่มีอะไรเข้ามา อย่าไปติดรอใน readline() (timeout ตั้ง 1 วิ)
+                # ไม่งั้นกว่าจะได้ยิง '?' รอบถัดไปก็ปาไป 1 วิ = เลยสวิตช์ไปไกลแล้ว
+                try:
+                    waiting = self.ser.in_waiting
+                except Exception:
+                    waiting = 1
+                if not waiting:
+                    time.sleep(0.02)
+                    continue
             try:
                 line = self.ser.readline().decode(errors="ignore").strip()
             except Exception as e:
@@ -150,6 +234,17 @@ class SerialWorker(QThread):
                 return
             if not line:
                 continue
+
+            lim = parse_lim(line)
+            if lim:
+                self._emit_limit(lim)
+                if watch and lim[LIMIT_AXIS] == 1:
+                    self._stop_motion()
+                    self.command_done.emit(cmd, "หยุด: แกน Y ชนลิมิตสวิตช์")
+                    self.limit_hit.emit()
+                    return
+                continue                  # บรรทัด status ไม่ใช่คำตอบของคำสั่ง
+
             if line == "ok" or line.startswith("error") or line.startswith("ALARM"):
                 if cmd.strip() == "$$":
                     self.settings.emit(self._parse_settings(lines))
@@ -183,10 +278,17 @@ class CNCController(QObject):
     connection_changed = pyqtSignal(bool)      # ต่อ/หลุด
     settings = pyqtSignal(dict)                # ค่า $$ ที่อ่านมาได้
     estopped = pyqtSignal()                    # หยุดฉุกเฉินเสร็จแล้ว
+    limit = pyqtSignal(list)                   # สถานะลิมิต [X, Y, Z]
+    limit_hit = pyqtSignal()                   # แกน Y ชนสวิตช์ระหว่างเดิน
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker = None
+        self.y_on_limit = False     # แกน Y ค้างอยู่บนสวิตช์อยู่ไหม
+        self.limit.connect(self._on_limit)
+
+    def _on_limit(self, lim):
+        self.y_on_limit = lim[LIMIT_AXIS] == 1
 
     # ---------- เชื่อมต่อ ----------
     def connect(self, port, baud):
@@ -200,6 +302,8 @@ class CNCController(QObject):
         self.worker.command_done.connect(self._on_command_done)
         self.worker.settings.connect(self.settings)
         self.worker.estopped.connect(self.estopped)
+        self.worker.limit.connect(self.limit)
+        self.worker.limit_hit.connect(self.limit_hit)
         self.worker.start()
 
     def disconnect(self):
@@ -208,6 +312,7 @@ class CNCController(QObject):
         self.worker.stop()
         self.worker.wait(3000)
         self.worker = None
+        self.y_on_limit = False
         self.connection_changed.emit(False)
 
     def is_connected(self):
@@ -239,8 +344,30 @@ class CNCController(QObject):
         return True
 
     def move(self, axis, amount, feed):
-        """สั่งเดินแบบ relative (G91 ถูกตั้งไว้ตอนต่อแล้ว)"""
+        """สั่งเดินแบบ relative (G91 ถูกตั้งไว้ตอนต่อแล้ว)
+
+        ถ้าแกน Y ค้างอยู่บนสวิตช์จะไม่ยอมสั่ง ต้อง homing ก่อน
+        ไม่งั้นดันเข้าไปอีกจนพัง
+        """
+        if axis == "Y" and self.y_on_limit:
+            self.log.emit("แกน Y ค้างอยู่บนลิมิตสวิตช์ — กด Homing ($H) ก่อน")
+            return False
         return self.send(f"G1 {axis}{amount} F{feed}")
+
+    def home(self):
+        """สั่ง $H ให้ GRBL วิ่งหา home เอง (ตั้งค่า homing ในเครื่องไว้แล้ว)
+
+        $H ตอบ ok ก็ต่อเมื่อวิ่งเสร็จ ส่วน G21/G91 ต่อท้ายเพราะหลัง homing
+        โหมดอาจไม่ใช่ relative แล้ว
+        """
+        if not self.is_connected():
+            self.log.emit("ยังไม่ได้เชื่อมต่อ")
+            return False
+        self.log.emit("กำลัง homing ($H) ... รอจนกว่าเครื่องจะวิ่งเสร็จ")
+        self.worker.send("$H")
+        self.worker.send("G21")
+        self.worker.send("G91")
+        return True
 
     def read_settings(self):
         """ขอค่า $$ ทั้งหมด — ผลจะกลับมาทาง signal settings"""
